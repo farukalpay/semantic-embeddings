@@ -5,7 +5,7 @@ A compact research toolkit for probing and manipulating **Word2Vec** spaces.  It
 * strip away high‑variance directions with four alternative *null‑cone operators*; and
 * generate semantic *fan‑out chains* that balance topical proximity against redundancy.
 
-The code is self‑contained (≈600 LOC), dependency‑light, and designed for interactive exploration at the command line.
+The code is self‑contained (≈450 LOC), dependency‑light, and designed for interactive exploration at the command line.
 
 ---
 
