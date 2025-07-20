@@ -11,14 +11,14 @@ The code is self‑contained (≈600 LOC), dependency‑light, and designed for
 
 ## 1  Features
 
-| Module                                                                                                    | Purpose                                                                               | Key flags                |
-| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------ |
-| **smooth**                                                                                                | Exponential low‑pass filter that removes a user‑specified fraction of total variance. | `--rho`, `--p`           |
-| **iso**                                                                                                   | Shrinkage `λ/(λ+β)` that keeps the cone isotropic while damping dominant axes.        | `--rho`                  |
-| **whiten**                                                                                                | Mahalanobis whitening plus radial clip, ideal for outlier suppression.                | `--alpha`                |
-| **combo**                                                                                                 | `smooth` followed by removal of the axes with largest excess kurtosis.                | `--rho`, `--rho2`, `--p` |
-| **/chain**                                                                                                | In‑console command that creates semantic chains according to the formula              |                          |
-| $\;\arg\max_v\;\big(\operatorname{cos}(v,x_t)\; -\; \lambda\max_{u\in S_t}\operatorname{cos}(v,u)\big)\;$ | parameters typed after `/chain`: `λ` (redundancy weight), `τ` (min. cosine)           |                          |
+| Module                                                                      | Purpose                                                                               | Key flags                |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------ |
+| **smooth**                                                                  | Exponential low‑pass filter that removes a user‑specified fraction of total variance. | `--rho`, `--p`           |
+| **iso**                                                                     | Shrinkage `λ/(λ+β)` that keeps the cone isotropic while damping dominant axes.        | `--rho`                  |
+| **whiten**                                                                  | Mahalanobis whitening plus radial clip, ideal for outlier suppression.                | `--alpha`                |
+| **combo**                                                                   | `smooth` followed by removal of the axes with largest excess kurtosis.                | `--rho`, `--rho2`, `--p` |
+| **/chain**                                                                  | In‑console command that creates semantic chains according to the formula              |                          |
+| $\;\arg\max_v\;\big(cos(v,x_t)\; -\; \lambda\max_{u\in S_t}cos(v,u)\big)\;$ | parameters typed after `/chain`: `λ` (redundancy weight), `τ` (min. cosine)           |                          |
 
 ---
 
@@ -56,13 +56,23 @@ Extra commands:  /chain [λ] [τ] sentence …
 
 ### Generating a chain
 
-```
+```text
 >>> /chain do simulation
 
 do  want  simulation  simulations  computer_simulations  numerical_simulations
 ```
 
-This reproduces the behaviour described in the accompanying paper: every step stays close to the current word (`simulation → simulations`) yet avoids looping back by penalising similarity to any previous choice.
+*The chain stays close to the current word yet avoids redundancy.*
+
+A more expansive demonstration:
+
+```text
+>>> /chain make foods
+
+make  making  made  foods  minimally_processed_foods  vegetables_legumes  unrefined_carbohydrates  beans_legumes  sweet_potatoes_carrots  carrots_sweet_potatoes  craisins  Serve_garnished  Serve_sprinkled  Sprinkle_evenly  sprinkle_evenly  Evenly_sprinkle  Gently_stir  Gently_fold  yolk_mixture  egg_yolk_mixture  gelatin_mixture  creamed_mixture  buttermilk_mixture  cornstarch_mixture  yeast_mixture  cup_confectioners_sugar  tablespoons_flour  cups_flour  cup_powdered_sugar  teaspoon_cinnamon  tablespoon_lemon_juice  tsp_salt  teaspoons_salt  ¼_teaspoon_salt  ½_teaspoon_salt  ¼_teaspoon  ½_teaspoon  ½_tsp  ¼_tsp  chili_powder_cumin  garlic_cumin  cumin_oregano  oregano_salt  cumin_salt  thyme_salt  chili_powder_salt  cumin_paprika  Add_onion_garlic  Add_onions_garlic  Add_onion_celery  Add_onions_celery  Add_onions_carrots  Chop_onion  onion_bell_pepper
+```
+
+*Starting from **make**, the chain fans into food‑related nouns, ingredient pairs, and finally instruction‑style bigrams—showcasing how the redundancy penalty keeps introducing fresh yet semantically linked tokens even across fifty steps.*
 
 ---
 
@@ -99,7 +109,7 @@ Inside the REPL:
 
 If you use this toolkit in academic work, please cite:
 
-> F. Alpay, *Spectral Null‑Cone Operators and Redundancy‑Balanced Semantic Chains*, 2025. ... will be added.
+> F. Alpay, *Spectral Null‑Cone Operators and Redundancy‑Balanced Semantic Chains*, 2025.
 
 ---
 
