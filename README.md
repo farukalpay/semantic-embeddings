@@ -72,11 +72,11 @@ A more expansive demonstration:
 make  making  made  foods  minimally_processed_foods  vegetables_legumes  unrefined_carbohydrates  beans_legumes  sweet_potatoes_carrots  carrots_sweet_potatoes  craisins  Serve_garnished  Serve_sprinkled  Sprinkle_evenly  sprinkle_evenly  Evenly_sprinkle  Gently_stir  Gently_fold  yolk_mixture  egg_yolk_mixture  gelatin_mixture  creamed_mixture  buttermilk_mixture  cornstarch_mixture  yeast_mixture  cup_confectioners_sugar  tablespoons_flour  cups_flour  cup_powdered_sugar  teaspoon_cinnamon  tablespoon_lemon_juice  tsp_salt  teaspoons_salt  ¼_teaspoon_salt  ½_teaspoon_salt  ¼_teaspoon  ½_teaspoon  ½_tsp  ¼_tsp  chili_powder_cumin  garlic_cumin  cumin_oregano  oregano_salt  cumin_salt  thyme_salt  chili_powder_salt  cumin_paprika  Add_onion_garlic  Add_onions_garlic  Add_onion_celery  Add_onions_celery  Add_onions_carrots  Chop_onion  onion_bell_pepper
 ```
 
+*Starting from **make**, the chain fans into food‑related nouns, ingredient pairs, and finally instruction‑style bigrams—showcasing how the redundancy penalty keeps introducing fresh yet semantically linked tokens even across fifty steps.*
+
 An example of `spectral_v5.py`. *Every version would give results with deeper semantic meanings.*
 
 ```text
-*Starting from **make**, the chain fans into food‑related nouns, ingredient pairs, and finally instruction‑style bigrams—showcasing how the redundancy penalty keeps introducing fresh yet semantically linked tokens even across fifty steps.*
-
 >>> /chain money
 [INFO] Chain seeds: ['money']
   money -> funds -> cash -> Monies -> moneys -> Moneys -> proceeds -> Funds -> Funding -> Fund -> Proceeds -> procedes -> Partial_proceeds -> proceeds_benefiting -> Monies_raised -> Monies_collected -> fund -> funding -> funded -> financing -> Funded -> bankrolled -> Bankrolled -> bankroll -> underwrite -> defray -> bankrolls -> defraying -> defrayed -> defrays -> underwrote -> underwrites -> underwritten -> bankrolling -> bankroller -> funder -> backer -> benefactor -> beneficiary -> Financed -> Supported -> Financing -> proceeds_benefitting -> monies -> taxpayer_dollars -> coffers -> warchest -> coffer -> kitty -> piggy_bank -> piggybank -> cookie_jar -> piggybanks -> piggy_banks -> Piggy_Bank -> checkbooks -> pockets -> pocketbooks -> Andreas_Widmer -> pocketbook
