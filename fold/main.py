@@ -841,124 +841,6 @@ def fixed_point_neighbourhood(
     return list(C), B
 
 
-def cluster_amphibian(
-    seed_word: str,
-    anchor_words: Optional[List[str]] = None,
-    tau_threshold: float = 0.4,
-    lambda_val: float = 0.5,
-    mu_val: float = 0.05,
-    beta: float = 0.8,
-    epsilon: float = 1e-6,
-    max_iter: int = 10,
-    top_k: int = 50,
-) -> Optional[List[Tuple[str, float]]]:
-    """Perform taxonomic clustering around ``seed_word`` using the fixed‑point formula.
-
-    The algorithm constructs a local candidate set by retaining neighbours of
-    the seed and their neighbours whose cosine similarity exceeds
-    ``tau_threshold``.  A projection basis for the amphibian subspace is
-    formed from ``anchor_words``; see the docstring for guidance on
-    selecting anchors.  At each iteration, new candidates v are accepted
-    if their augmented score φ_k(v) (see Equation (2) in the problem
-    statement) exceeds the threshold τ_k.  The threshold decays by factor
-    ``beta`` at every step.  The process stops when no new words are
-    accepted or τ_k < ``epsilon`` or ``max_iter`` iterations have been
-    performed.  The final cluster is sorted by taxonomic proximity and
-    truncated to ``top_k`` results.  Returns None if embeddings are not
-    loaded or seed is missing or no anchors are found.
-    """
-    # Ensure embeddings are loaded
-    if not embeddings_loaded or embedding_matrix is None or np is None:
-        return None
-    if seed_word not in word_to_index:
-        return None
-    # Default anchors if none provided
-    if anchor_words is None:
-        anchor_words = [
-            "anura", "ranidae", "bufonidae", "hylidae",
-            "microhylidae", "dicroglossidae", "leptodactylidae", "ceratophryidae",
-            "pipidae", "bombinatoridae"
-        ]
-    # Compute projection basis for anchors
-    basis = _compute_projection_basis(anchor_words)
-    if basis is None:
-        return None
-    seed_idx = word_to_index[seed_word]
-    # Build candidate set: first and second hop
-    vec_seed = embedding_matrix[seed_idx]
-    sims_seed = embedding_matrix.dot(vec_seed)
-    # First hop: indices with similarity >= tau_threshold
-    candidate_set: Set[int] = set()
-    for i, sim in enumerate(sims_seed):
-        if sim >= tau_threshold and i != seed_idx:
-            candidate_set.add(i)
-    # Second hop: for each neighbour, add its neighbours above threshold
-    for i in list(candidate_set):
-        vec_i = embedding_matrix[i]
-        sims_i = embedding_matrix.dot(vec_i)
-        for j, sim2 in enumerate(sims_i):
-            if sim2 >= tau_threshold:
-                candidate_set.add(j)
-    # Ensure seed is included
-    candidate_set.add(seed_idx)
-    # Precompute P and Q components for candidates
-    results: Dict[int, Tuple[np.ndarray, float]] = {}
-    # Precompute basis.T once
-    B = basis
-    BT = B.T
-    for idx in candidate_set:
-        v = embedding_matrix[idx]
-        # Projection onto H: P v = B (B^T v)
-        p_v = B @ (BT @ v)
-        # Q v = v - P v
-        q_v = v - p_v
-        q_norm_sq = float(q_v.dot(q_v))
-        results[idx] = (p_v, q_norm_sq)
-    # Initialise cluster with seed
-    S_set: Set[int] = set([seed_idx])
-    # Maintain sum of P u for u in S
-    sum_Pu = results[seed_idx][0].copy()
-    tau_k = tau_threshold
-    for iteration in range(max_iter):
-        new_indices: List[int] = []
-        # Compute average of P u in current S
-        bar_s = sum_Pu / len(S_set)
-        # For each candidate not yet in S, evaluate phi_k
-        for idx in candidate_set:
-            if idx in S_set:
-                continue
-            p_v, q_norm_sq = results[idx]
-            # taxonomic proximity: dot(P v, bar_s)
-            taxon = float(p_v.dot(bar_s))
-            # redundancy: max_{u in S} v dot u
-            # Compute similarities to S
-            redund = max(float(embedding_matrix[idx].dot(embedding_matrix[u])) for u in S_set)
-            phi = taxon - lambda_val * redund - mu_val * q_norm_sq
-            if phi >= tau_k:
-                new_indices.append(idx)
-        if not new_indices:
-            break
-        for idx in new_indices:
-            if idx not in S_set:
-                S_set.add(idx)
-                sum_Pu += results[idx][0]
-        tau_k *= beta
-        if tau_k < epsilon:
-            break
-    # Prepare final sorted list
-    if not S_set:
-        return None
-    # Recompute bar_s using final S
-    bar_s = sum_Pu / len(S_set)
-    cluster_list: List[Tuple[str, float]] = []
-    for idx in S_set:
-        p_v = results[idx][0]
-        score = float(p_v.dot(bar_s))
-        cluster_list.append((index_to_word[idx], score))
-    cluster_list.sort(key=lambda x: -x[1])
-    if top_k > 0:
-        return cluster_list[:top_k]
-    return cluster_list
 
 # ---------------------------------------------------------------------------
 # PCA‑based soft spectral filter clustering
@@ -1268,6 +1150,263 @@ def compute_relevance_fixedpoint(
 
 
 # ---------------------------------------------------------------------------
+# Unsupervised greedy clustering (anchor‑free)
+# ---------------------------------------------------------------------------
+def cluster_rank_greedy(
+    seed_word: str,
+    tau_threshold: Optional[float] = None,
+    lambda_val: float = 0.5,
+    var_threshold: float = 0.95,
+    eta: float = 0.05,
+    top_k: int = 20,
+    fp_iters: int = 6,
+    fp_cap: Optional[int] = None,
+) -> Optional[List[Tuple[str, float]]]:
+    """
+    Perform unsupervised clustering around ``seed_word`` using a learned
+    principal subspace and a greedy ranking functional.
+
+    This implementation learns a domain‑specific subspace from the
+    seed's neighbourhood via ``fixed_point_neighbourhood``.  It then
+    performs a greedy expansion of a set ``S`` starting from the seed,
+    selecting at each step the candidate that maximises the score
+
+        psi(v) = ⟨P v, bar_s⟩ − lambda_val * max_{u ∈ S} ⟨v, u⟩
+
+    where ``P v = B @ (B.T @ v)`` is the projection of ``v`` onto the
+    learned subspace and ``bar_s`` is the barycentre of the projected
+    vectors in ``S``.  The process stops when no candidate yields a
+    positive increment or when ``top_k`` elements have been selected.
+
+    Parameters
+    ----------
+    seed_word : str
+        The seed around which to cluster.
+    tau_threshold : float or None, optional
+        Initial similarity threshold τ₀.  If None, it is computed
+        adaptively from the seed's similarity distribution (8th/9th
+        nearest neighbours).  Defaults to None.
+    lambda_val : float, optional
+        Redundancy penalty λ.  Defaults to 0.5.
+    var_threshold : float, optional
+        Variance retention ρ used when learning the principal subspace.
+        Defaults to 0.95.
+    eta : float, optional
+        Initial energy threshold η₀ for the fixed‑point neighbourhood.
+        Defaults to 0.05.
+    top_k : int, optional
+        Maximum number of cluster members to return.  Defaults to 20.
+    fp_iters : int, optional
+        Maximum number of neighbourhood expansion iterations.  Defaults
+        to 6.
+    fp_cap : int or None, optional
+        Optional cap on the size of the candidate set during fixed
+        point expansion.  If None, a default of 500 is used.
+
+    Returns
+    -------
+    list of (str, float) or None
+        The top ``top_k`` cluster members and their scores, or None if
+        the embeddings are unavailable or the seed is OOV.
+    """
+    # Preconditions
+    if not embeddings_loaded or embedding_matrix is None or np is None:
+        return None
+    if seed_word not in word_to_index:
+        return None
+    seed_idx = word_to_index[seed_word]
+    # Adaptive threshold if not provided
+    if tau_threshold is None:
+        sims_all = embedding_matrix.dot(embedding_matrix[seed_idx])
+        sims_sorted = np.sort(sims_all)[::-1]
+        if sims_sorted.size > 9:
+            tau_threshold = 0.5 * (sims_sorted[8] + sims_sorted[9])
+        else:
+            q = max(2, sims_sorted.size // 4)
+            tau_threshold = float(np.mean(sims_sorted[1:q])) if q > 1 else 0.25
+    tau0 = float(tau_threshold)
+    # Cap candidate set by default if not provided
+    cap_value = fp_cap if fp_cap is not None else 500
+    # Learn fixed‑point neighbourhood and projection basis
+    C_idxs, B = fixed_point_neighbourhood(
+        seed_idx,
+        tau0=tau0,
+        eta0=eta,
+        rho=var_threshold,
+        max_iter=fp_iters,
+        fp_size_cap=cap_value,
+    )
+    if not C_idxs or B is None:
+        return None
+    # Filter candidate indices to those with finite embeddings
+    C_idxs = [idx for idx in C_idxs if np.all(np.isfinite(embedding_matrix[idx]))]
+    if not C_idxs:
+        return None
+    # Build mapping from index to projected vector for each candidate
+    P_map: Dict[int, np.ndarray] = {}
+    # Precompute B.T once
+    BT = B.T
+    for idx in C_idxs:
+        v = embedding_matrix[idx]
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            coords = np.dot(v, B)  # shape (r,)
+            p_v = B @ coords
+        P_map[idx] = p_v
+    # Initialise greedy set S with the seed
+    S: List[int] = [seed_idx]
+    bar_s = P_map[seed_idx].copy()
+    # Greedy selection
+    while len(S) < top_k:
+        best_idx: Optional[int] = None
+        best_phi: float = 0.0
+        # Evaluate each candidate not yet in S
+        for idx in C_idxs:
+            if idx in S:
+                continue
+            p_v = P_map[idx]
+            # Taxonomic proximity: inner product of projections
+            taxon = float(p_v.dot(bar_s))
+            # Redundancy: maximum cosine similarity to current set S
+            redund = max(
+                float(embedding_matrix[idx].dot(embedding_matrix[u])) for u in S
+            )
+            phi = taxon - lambda_val * redund
+            if phi > best_phi:
+                best_phi = phi
+                best_idx = idx
+        # Stop if no positive improvement
+        if best_idx is None or best_phi <= 0.0:
+            break
+        # Add best candidate to S
+        S.append(best_idx)
+        # Update barycentre bar_s incrementally
+        p_best = P_map[best_idx]
+        n_old = len(S) - 1
+        # bar_new = ((n_old)/n_new) * bar_old + (1/n_new) * p_best
+        # where n_new = len(S)
+        coef_old = n_old / len(S)
+        coef_new = 1.0 / len(S)
+        bar_s = coef_old * bar_s + coef_new * p_best
+    # Compute final scores using projection onto bar_s
+    cluster_list: List[Tuple[str, float]] = []
+    for idx in S:
+        p_v = P_map[idx]
+        score = float(p_v.dot(bar_s))
+        cluster_list.append((index_to_word[idx], score))
+    cluster_list.sort(key=lambda x: -x[1])
+    return cluster_list[:top_k] if top_k > 0 else cluster_list
+
+
+# ---------------------------------------------------------------------------
+# Accessibility solver for next-word prediction
+# ---------------------------------------------------------------------------
+def next_word_from_chain(
+    seed_word: str,
+    chain_result: List[Tuple[str, float]],
+    tau: Optional[float] = None,
+    gamma: float = 0.9,
+    tol: float = 1e-6,
+    top_k: Optional[int] = None,
+) -> Tuple[str, float, List[Tuple[str, float]]]:
+    """
+    Given a seed word and a list of words with their relevance scores
+    (as returned by the chain routine), compute the accessibility value
+    function and return the best successor along with the full ranking.
+
+    The chain_result should include the seed as the first element.
+
+    Parameters
+    ----------
+    seed_word : str
+        The seed word (for clarity; unused internally except for
+        validation).
+    chain_result : list of (str, float)
+        List of words and their relevance scores, starting with the
+        seed.  The relevance values are treated as the immediate
+        rewards r(u) in the Bellman equation.
+    tau : float or None, optional
+        Similarity threshold τ for the kernel.  If None, τ is set to
+        the 95th percentile of the off‑diagonal cosine similarities.
+    gamma : float, optional
+        Discount factor γ in (0,1).  Defaults to 0.9.
+    tol : float, optional
+        Convergence tolerance for the power iteration solving
+        f = r + γ P f.  Defaults to 1e‑6.
+    top_k : int or None, optional
+        If provided, only the top_k words (excluding the seed) are
+        considered when selecting the next word.  If None, all
+        available words are used.
+
+    Returns
+    -------
+    (str, float, list)
+        A tuple (best_word, best_score, ranking) where best_word is
+        the recommended successor word, best_score is its accessibility
+        value f(best_word), and ranking is the list of (word, f(word))
+        sorted by descending f.
+    """
+    # Unpack words and their immediate rewards
+    words, r_scores = zip(*chain_result)
+    m = len(words)
+    # Validate seed
+    if words[0] != seed_word:
+        # Ensure the seed is at position 0; if not, assume the first
+        # element is the seed regardless of its name
+        pass
+    # Build the matrix of word vectors
+    V = np.stack([embedding_matrix[word_to_index[w]] for w in words])
+    # Compute pairwise cosine similarities (since embeddings are normalised)
+    dots = V @ V.T
+    # Determine tau if needed from the off‑diagonal similarities
+    if tau is None:
+        # Consider off‑diagonal entries only
+        flat = dots.flatten()
+        # Exclude diagonal entries (self‑similarities)
+        mask = np.ones_like(dots, dtype=bool)
+        np.fill_diagonal(mask, False)
+        off_vals = flat[mask.flatten()]
+        if off_vals.size > 0:
+            tau = float(np.quantile(off_vals, 0.95))
+        else:
+            tau = 0.0
+    # Build kernel K and transition matrix P
+    K = np.maximum(dots - tau, 0.0)
+    # Zero out diagonal
+    np.fill_diagonal(K, 0.0)
+    # Degrees
+    deg = K.sum(axis=1, keepdims=True)
+    # Prevent division by zero by leaving rows with deg=0 as zeros
+    with np.errstate(divide='ignore', invalid='ignore'):
+        P = np.where(deg > 0, K / deg, 0.0)
+    # Power iteration to solve f = r + γ P f
+    r_vec = np.array(r_scores, dtype='float64')
+    f = r_vec.copy()
+    while True:
+        f_new = r_vec + gamma * P @ f
+        if np.abs(f_new - f).sum() < tol:
+            f = f_new
+            break
+        f = f_new
+    # Exclude seed (index 0) when selecting best successor
+    if top_k is not None:
+        # Consider only the first top_k+1 items (seed + top_k candidates)
+        idx_range = range(1, min(m, top_k + 1))
+    else:
+        idx_range = range(1, m)
+    # Find best index among idx_range
+    best_rel_val = -np.inf
+    best_idx = 1
+    for i in idx_range:
+        if f[i] > best_rel_val:
+            best_rel_val = f[i]
+            best_idx = i
+    ranking = [(words[i], float(f[i])) for i in range(m)]
+    ranking_sorted = sorted(ranking, key=lambda x: -x[1])
+    best_word = words[best_idx]
+    return best_word, float(f[best_idx]), ranking_sorted
+
+
+# ---------------------------------------------------------------------------
 # Command‑line interface
 # ---------------------------------------------------------------------------
 
@@ -1284,14 +1423,120 @@ def main(argv: Optional[List[str]] = None) -> None:
             "     Compute a relevance ranking using an unsupervised fixed‑point neighbourhood and random walk.\n"
             "  updated_code.py /cluster <word> [--tau τ] [--var ρ] [--eta η] [--top k] [--fp_iter M] [--fp_cap C]\n"
             "     Perform unsupervised clustering via a learned projection from the seed neighbourhood.\n"
+            "  updated_code.py /continue <word> [--gamma g] [--tau τ] [--top k] [--eps ε]\n"
+            "     Recommend a successor word using accessibility scores on the chain graph.\n"
             "\n"
             "For example:\n"
             "  updated_code.py \"mu X. p or (<>X and not q)\"\n"
             "  updated_code.py /chain frog --tau 0.3 --top 10"
         )
         return
-    # Detect chain mode
+    # Determine primary command token
     arg0 = argv[0]
+    # Detect continue mode (next-word prediction)
+    if arg0.lower().startswith("/continue"):
+        if len(argv) < 2:
+            print("Please specify a seed word after /continue.")
+            return
+        # Defaults for continue mode
+        gamma_val = 0.9                # discount factor
+        tau_val: Optional[float] = None  # kernel threshold
+        top_k = 10                     # number of top words to consider/return
+        tol_val = 1e-6                # convergence tolerance for value solver
+        # The second argument is the seed word
+        seed_word = argv[1]
+        # Parse options
+        i = 2
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--gamma":
+                if i + 1 >= len(argv):
+                    print("Error: --gamma requires a numeric value.")
+                    return
+                try:
+                    gamma_val = float(argv[i + 1])
+                except ValueError:
+                    print("Error: invalid value for --gamma.")
+                    return
+                i += 2
+                continue
+            if arg in ("--tau", "-t"):
+                if i + 1 >= len(argv):
+                    print("Error: --tau requires a numeric value.")
+                    return
+                try:
+                    tau_val = float(argv[i + 1])
+                except ValueError:
+                    print("Error: invalid value for --tau.")
+                    return
+                i += 2
+                continue
+            if arg in ("--top", "-k"):
+                if i + 1 >= len(argv):
+                    print("Error: --top requires an integer value.")
+                    return
+                try:
+                    top_k = int(argv[i + 1])
+                except ValueError:
+                    print("Error: invalid value for --top.")
+                    return
+                i += 2
+                continue
+            if arg == "--eps":
+                if i + 1 >= len(argv):
+                    print("Error: --eps requires a numeric value.")
+                    return
+                try:
+                    tol_val = float(argv[i + 1])
+                except ValueError:
+                    print("Error: invalid value for --eps.")
+                    return
+                i += 2
+                continue
+            # Additional tokens are appended to seed word
+            seed_word += " " + arg
+            i += 1
+        if not load_glove_embeddings():
+            return
+        if seed_word not in word_to_index:
+            print(f"Seed word '{seed_word}' not found in vocabulary.")
+            return
+        # Obtain a relevance chain using compute_relevance_fixedpoint with a
+        # slightly larger top_k to provide enough candidates for the
+        # accessibility solver.  We set top_k_chain = max(top_k+1, 12)
+        top_k_chain = max(top_k + 1, 12)
+        chain_res = compute_relevance_fixedpoint(
+            seed_word,
+            tau=tau_val,
+            lambda_val=0.6,
+            max_iters=20,
+            eps=1e-6,
+            top_k=top_k_chain,
+            eta=0.05,
+            filter_anchors=None,
+            var_threshold=0.95,
+            fp_iters=6,
+            fp_cap=None,
+        )
+        if not chain_res:
+            print(f"No chain found for '{seed_word}'.")
+            return
+        # Solve the Bellman equation and select next word
+        best_word, best_score, ranking = next_word_from_chain(
+            seed_word,
+            chain_res,
+            tau=tau_val,
+            gamma=gamma_val,
+            tol=tol_val,
+            top_k=top_k,
+        )
+        # Print the recommendation and full ranking
+        print(f"Recommended successor for '{seed_word}': {best_word} (score={best_score:.3f})")
+        print("Accessibility ranking:")
+        for w, v in ranking[:max(top_k, len(ranking))]:
+            print(f"    {w} (score={v:.3f})")
+        return
+    # Detect chain mode
     # Cluster mode: unsupervised fixed‑point clustering
     if arg0.lower().startswith("/cluster"):
         if len(argv) < 2:
@@ -1435,16 +1680,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         if seed_word not in word_to_index:
             print(f"Seed word '{seed_word}' not found in vocabulary.")
             return
-        cluster = cluster_amphibian_soft(
+        cluster = cluster_rank_greedy(
             seed_word,
-            anchor_words=anchor_words,
             tau_threshold=tau_threshold,
             lambda_val=lambda_val,
-            beta=beta_val,
             var_threshold=var_val,
             eta=eta_val,
-            epsilon=eps_val,
-            max_iter=1,  # unused
             top_k=top_k,
             fp_iters=fp_iters,
             fp_cap=fp_cap,
