@@ -1348,54 +1348,80 @@ def next_word_from_chain(
     # Unpack words and their immediate rewards
     words, r_scores = zip(*chain_result)
     m = len(words)
-    # Validate seed
-    if words[0] != seed_word:
-        # Ensure the seed is at position 0; if not, assume the first
-        # element is the seed regardless of its name
-        pass
-    # Build the matrix of word vectors
+    # Ensure the seed is at index 0
+    # Build vectors for words, filtering out any with non‑finite embeddings
+    valid_pairs = []
+    for w, r in chain_result:
+        vec = embedding_matrix[word_to_index[w]]
+        if np.all(np.isfinite(vec)):
+            valid_pairs.append((w, r))
+    if not valid_pairs:
+        return seed_word, 0.0, []
+    words, r_scores = zip(*valid_pairs)
+    m = len(words)
+    # Recompute index of seed
+    seed_index = 0  # seed is first element by construction
+    # Build pairwise cosine similarity matrix safely
     V = np.stack([embedding_matrix[word_to_index[w]] for w in words])
-    # Compute pairwise cosine similarities (since embeddings are normalised)
-    dots = V @ V.T
+    # Compute pairwise dots using loops to avoid large matmul warnings
+    dots = np.zeros((m, m), dtype=np.float64)
+    for i in range(m):
+        vi = V[i]
+        for j in range(i, m):
+            vj = V[j]
+            # Compute dot product with errstate protection
+            with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                dot = float(np.dot(vi, vj))
+            dots[i, j] = dot
+            dots[j, i] = dot
     # Determine tau if needed from the off‑diagonal similarities
     if tau is None:
         # Consider off‑diagonal entries only
-        flat = dots.flatten()
-        # Exclude diagonal entries (self‑similarities)
-        mask = np.ones_like(dots, dtype=bool)
-        np.fill_diagonal(mask, False)
-        off_vals = flat[mask.flatten()]
-        if off_vals.size > 0:
+        off_vals = [dots[i, j] for i in range(m) for j in range(m) if i != j]
+        if off_vals:
             tau = float(np.quantile(off_vals, 0.95))
         else:
             tau = 0.0
-    # Build kernel K and transition matrix P
-    K = np.maximum(dots - tau, 0.0)
-    # Zero out diagonal
-    np.fill_diagonal(K, 0.0)
-    # Degrees
-    deg = K.sum(axis=1, keepdims=True)
-    # Prevent division by zero by leaving rows with deg=0 as zeros
-    with np.errstate(divide='ignore', invalid='ignore'):
-        P = np.where(deg > 0, K / deg, 0.0)
-    # Power iteration to solve f = r + γ P f
-    r_vec = np.array(r_scores, dtype='float64')
-    f = r_vec.copy()
+    # Build kernel K and transition matrix P using loops
+    K = np.zeros((m, m), dtype=np.float64)
+    for i in range(m):
+        for j in range(m):
+            if i == j:
+                continue
+            val = dots[i, j] - tau
+            if val > 0.0:
+                K[i, j] = val
+    # Row sums
+    deg = np.sum(K, axis=1)
+    P = np.zeros((m, m), dtype=np.float64)
+    for i in range(m):
+        if deg[i] > 0.0:
+            P[i] = K[i] / deg[i]
+    # Initialise f and restart vector for personalised PageRank
+    # e0: one‑hot vector at seed_index
+    e0 = np.zeros(m, dtype=np.float64)
+    e0[seed_index] = 1.0
+    restart_vec = (1.0 - gamma) * e0
+    f = e0.copy()
+    # Power iteration to solve f = (1-γ)e0 + γ P f
     while True:
-        f_new = r_vec + gamma * P @ f
+        # Compute P @ f safely using loops
+        update = np.zeros(m, dtype=np.float64)
+        for i in range(m):
+            # Dot product of row i of P with f
+            update[i] = float(np.dot(P[i], f))
+        f_new = restart_vec + gamma * update
         if np.abs(f_new - f).sum() < tol:
             f = f_new
             break
         f = f_new
-    # Exclude seed (index 0) when selecting best successor
+    # Select best successor (exclude seed_index)
     if top_k is not None:
-        # Consider only the first top_k+1 items (seed + top_k candidates)
         idx_range = range(1, min(m, top_k + 1))
     else:
         idx_range = range(1, m)
-    # Find best index among idx_range
     best_rel_val = -np.inf
-    best_idx = 1
+    best_idx = seed_index + 1 if m > 1 else seed_index
     for i in idx_range:
         if f[i] > best_rel_val:
             best_rel_val = f[i]
