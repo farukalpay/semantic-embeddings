@@ -1307,11 +1307,13 @@ def next_word_from_chain(
     gamma: float = 0.9,
     tol: float = 1e-6,
     top_k: Optional[int] = None,
+    p: float = 1.3,
 ) -> Tuple[str, float, List[Tuple[str, float]]]:
     """
     Given a seed word and a list of words with their relevance scores
-    (as returned by the chain routine), compute the accessibility value
-    function and return the best successor along with the full ranking.
+    (as returned by the chain routine), compute a personalised‑PageRank
+    accessibility value function and return the best successor along with
+    the full ranking.
 
     The chain_result should include the seed as the first element.
 
@@ -1321,21 +1323,27 @@ def next_word_from_chain(
         The seed word (for clarity; unused internally except for
         validation).
     chain_result : list of (str, float)
-        List of words and their relevance scores, starting with the
-        seed.  The relevance values are treated as the immediate
-        rewards r(u) in the Bellman equation.
+        List of words and their relevance scores, starting with the seed.
+        These scores are ignored for the personalised PageRank computation;
+        the restart vector concentrates all mass at the seed.
     tau : float or None, optional
         Similarity threshold τ for the kernel.  If None, τ is set to
         the 95th percentile of the off‑diagonal cosine similarities.
     gamma : float, optional
         Discount factor γ in (0,1).  Defaults to 0.9.
     tol : float, optional
-        Convergence tolerance for the power iteration solving
-        f = r + γ P f.  Defaults to 1e‑6.
+        Convergence tolerance for the personalised PageRank solver.
+        Defaults to 1e‑6.
     top_k : int or None, optional
         If provided, only the top_k words (excluding the seed) are
         considered when selecting the next word.  If None, all
         available words are used.
+    p : float, optional
+        Exponent applied to each cosine similarity when constructing
+        the kernel.  The weight between two words ``i`` and ``j`` is
+        defined as ``w_ij = (s_ij)**p`` if ``s_ij ≥ τ`` and zero
+        otherwise.  Values of ``p`` between 1 and 2 emphasise stronger
+        links without shifting weaker similarities.  Default is 1.3.
 
     Returns
     -------
@@ -1345,25 +1353,24 @@ def next_word_from_chain(
         value f(best_word), and ranking is the list of (word, f(word))
         sorted by descending f.
     """
-    # Unpack words and their immediate rewards
-    words, r_scores = zip(*chain_result)
-    m = len(words)
-    # Ensure the seed is at index 0
-    # Build vectors for words, filtering out any with non‑finite embeddings
-    valid_pairs = []
-    for w, r in chain_result:
+    # Unpack words; ignore relevance scores since personalised PageRank
+    # uses only the seed as the restart vector.  Filter out any words
+    # whose embeddings are not finite.
+    valid_words: List[str] = []
+    for w, _ in chain_result:
         vec = embedding_matrix[word_to_index[w]]
         if np.all(np.isfinite(vec)):
-            valid_pairs.append((w, r))
-    if not valid_pairs:
+            valid_words.append(w)
+    if not valid_words:
         return seed_word, 0.0, []
-    words, r_scores = zip(*valid_pairs)
+    words = tuple(valid_words)
     m = len(words)
-    # Recompute index of seed
-    seed_index = 0  # seed is first element by construction
-    # Build pairwise cosine similarity matrix safely
+    # The seed is always at index 0
+    seed_index = 0
+    # Build pairwise cosine similarity matrix safely via nested loops to
+    # avoid constructing a full d×d product that may overflow.  "dots"
+    # stores s_ij = ⟨v_i, v_j⟩ for i,j in [0, m).
     V = np.stack([embedding_matrix[word_to_index[w]] for w in words])
-    # Compute pairwise dots using loops to avoid large matmul warnings
     dots = np.zeros((m, m), dtype=np.float64)
     for i in range(m):
         vi = V[i]
@@ -1371,9 +1378,9 @@ def next_word_from_chain(
             vj = V[j]
             # Compute dot product with errstate protection
             with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-                dot = float(np.dot(vi, vj))
-            dots[i, j] = dot
-            dots[j, i] = dot
+                dot_ij = float(np.dot(vi, vj))
+            dots[i, j] = dot_ij
+            dots[j, i] = dot_ij
     # Determine tau if needed from the off‑diagonal similarities
     if tau is None:
         # Consider off‑diagonal entries only
@@ -1382,35 +1389,41 @@ def next_word_from_chain(
             tau = float(np.quantile(off_vals, 0.95))
         else:
             tau = 0.0
-    # Build kernel K and transition matrix P using loops
+    # Build kernel K and transition matrix P using the exponent weight.  The
+    # kernel weight w_ij = (s_ij)**p if s_ij ≥ tau, otherwise 0.  This
+    # preserves strong connections and discards weaker ones without
+    # subtracting τ, avoiding the hard shift that breaks connectivity.
     K = np.zeros((m, m), dtype=np.float64)
     for i in range(m):
         for j in range(m):
             if i == j:
                 continue
-            val = dots[i, j] - tau
-            if val > 0.0:
-                K[i, j] = val
+            s_ij = dots[i, j]
+            # Apply threshold and exponent
+            if s_ij >= tau:
+                with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+                    K[i, j] = float(s_ij) ** p
     # Row sums
     deg = np.sum(K, axis=1)
     P = np.zeros((m, m), dtype=np.float64)
     for i in range(m):
         if deg[i] > 0.0:
             P[i] = K[i] / deg[i]
-    # Initialise f and restart vector for personalised PageRank
-    # e0: one‑hot vector at seed_index
+    # Personalised PageRank: restart on seed.  e0 is the one‑hot seed
     e0 = np.zeros(m, dtype=np.float64)
     e0[seed_index] = 1.0
     restart_vec = (1.0 - gamma) * e0
+    # Initialise f to e0 (mass starts entirely at seed)
     f = e0.copy()
-    # Power iteration to solve f = (1-γ)e0 + γ P f
+    # Power iteration: f_{new} = (1-γ) e0 + γ P f
     while True:
-        # Compute P @ f safely using loops
         update = np.zeros(m, dtype=np.float64)
+        # Compute P @ f using explicit dot products per row
         for i in range(m):
-            # Dot product of row i of P with f
-            update[i] = float(np.dot(P[i], f))
+            if deg[i] > 0.0:
+                update[i] = float(np.dot(P[i], f))
         f_new = restart_vec + gamma * update
+        # Check convergence in L1 norm
         if np.abs(f_new - f).sum() < tol:
             f = f_new
             break
@@ -1528,9 +1541,19 @@ def main(argv: Optional[List[str]] = None) -> None:
             print(f"Seed word '{seed_word}' not found in vocabulary.")
             return
         # Obtain a relevance chain using compute_relevance_fixedpoint with a
-        # slightly larger top_k to provide enough candidates for the
-        # accessibility solver.  We set top_k_chain = max(top_k+1, 12)
-        top_k_chain = max(top_k + 1, 12)
+        # larger candidate list to ensure that important bigrams survive
+        # the initial truncation.  A principled choice is c·log(m) with
+        # c≈4, but here we set a floor of 60.  If ``top_k`` is larger,
+        # add one extra to preserve the seed.
+        try:
+            import math
+            # Determine an adaptive candidate size based on the total
+            # vocabulary size (embedding_matrix may not be None here)
+            vocab_size = embedding_matrix.shape[0] if embedding_matrix is not None else 400000
+            adaptive_size = int(math.ceil(4.0 * math.log(max(vocab_size, 2))))
+        except Exception:
+            adaptive_size = 60
+        top_k_chain = max(top_k + 1, adaptive_size, 60)
         chain_res = compute_relevance_fixedpoint(
             seed_word,
             tau=tau_val,
@@ -1719,7 +1742,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         if cluster is None or not cluster:
             print(f"No cluster found for '{seed_word}'.")
             return
-        print(f"Amphibian cluster for '{seed_word}':")
+        # Print a generic cluster heading instead of "Amphibian cluster".
+        # The clustering is now anchor‑free and applies to any domain.
+        print(f"Cluster for '{seed_word}':")
         for name, score in cluster:
             print(f"    {name} (score={score:.3f})")
         return
